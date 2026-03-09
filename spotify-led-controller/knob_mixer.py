@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-Knob-controlled song crossfade mixer.
+Knob-controlled song crossfade mixer with stem-based transitions.
 
-Reads a potentiometer value from an Arduino over serial and crossfades
-between up to 6 local audio files.  Adjacent songs blend smoothly as
-the knob turns using an equal-power crossfade curve.
+Reads a potentiometer value from an Arduino over serial and transitions
+between up to 6 local audio files.  Each song is separated into three
+stems via demucs: vocals, beats (drums+bass), and tops (melodic
+instruments).  Transitions swap one layer at a time — first the beats,
+then the tops, then the vocals — creating a smooth mashup-style blend
+between adjacent tracks.
 
 Usage:
     python knob_mixer.py                        # Arduino connected
     python knob_mixer.py --mock                 # auto-sweep simulation
     python knob_mixer.py --mock --value 512     # fixed knob position
+    python knob_mixer.py --no-stems             # simple volume crossfade
 
 Audio files go in the songs/ directory (MP3, WAV, FLAC, OGG, AIFF).
 They are loaded in alphabetical order.
@@ -36,7 +40,9 @@ from config import (
     SUPPORTED_AUDIO_EXTENSIONS,
     get_serial_port,
     get_songs_dir,
+    get_stems_dir,
 )
+from stem_separator import ensure_stems, load_stems
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +152,178 @@ def knob_to_gains(knob_value: int, num_songs: int) -> List[float]:
     gains[idx] = math.cos(blend * math.pi / 2)
     gains[idx + 1] = math.sin(blend * math.pi / 2)
     return gains
+
+
+def knob_to_stem_gains(
+    knob_value: int, num_songs: int,
+) -> List[Tuple[float, float, float]]:
+    """Map a raw 0-1023 knob reading to per-song (vocal, beats, tops) gains.
+
+    The transition between adjacent songs has three phases:
+      1. First third  — beats crossfade A->B, vocals & tops stay on A.
+      2. Middle third  — tops crossfade A->B, vocals stays A, beats stays B.
+      3. Last third   — vocals crossfade A->B, beats & tops stay on B.
+
+    Equal-power curves are used within each sub-transition.
+    """
+    position = (knob_value / 1023.0) * (num_songs - 1)
+    idx = int(position)
+    if idx >= num_songs - 1:
+        idx = num_songs - 2
+        blend = 1.0
+    else:
+        blend = position - idx
+
+    third = 1.0 / 3.0
+    gains: List[Tuple[float, float, float]] = [(0.0, 0.0, 0.0)] * num_songs
+
+    if blend <= third:
+        # Phase 1: swap beats
+        sub = blend / third
+        c = math.cos(sub * math.pi / 2)
+        s = math.sin(sub * math.pi / 2)
+        gains[idx] = (1.0, c, 1.0)
+        gains[idx + 1] = (0.0, s, 0.0)
+    elif blend <= 2 * third:
+        # Phase 2: swap tops
+        sub = (blend - third) / third
+        c = math.cos(sub * math.pi / 2)
+        s = math.sin(sub * math.pi / 2)
+        gains[idx] = (1.0, 0.0, c)
+        gains[idx + 1] = (0.0, 1.0, s)
+    else:
+        # Phase 3: swap vocals
+        sub = (blend - 2 * third) / third
+        c = math.cos(sub * math.pi / 2)
+        s = math.sin(sub * math.pi / 2)
+        gains[idx] = (c, 0.0, 0.0)
+        gains[idx + 1] = (s, 1.0, 1.0)
+
+    return gains
+
+
+class StemTransitionManager:
+    """Direction-aware stem crossfade: always transitions beats→tops→vocals.
+
+    Unlike the stateless ``knob_to_stem_gains``, this class tracks per-stem
+    blend state so that reversing the knob still swaps beats before vocals.
+    Each adjacent song-pair has three independent blend values (beats, tops,
+    vocals) that are driven by knob *deltas*, using a cascading fill/drain
+    model: forward fills beats first, then tops, then vocals; backward
+    drains beats first, then tops, then vocals.
+    """
+
+    def __init__(self, num_songs: int):
+        self.num_songs = num_songs
+        # Per adjacent pair: [beats, tops, vocals] blend (0 = song A, 1 = song B)
+        self._pairs: List[List[float]] = [
+            [0.0, 0.0, 0.0] for _ in range(max(1, num_songs - 1))
+        ]
+        self._prev_position: Optional[float] = None
+        self._gains: List[Tuple[float, float, float]] = [
+            (0.0, 0.0, 0.0)
+        ] * num_songs
+
+    @property
+    def gains(self) -> List[Tuple[float, float, float]]:
+        """Last computed per-song (vocal, beats, tops) gains (read-only)."""
+        return self._gains
+
+    def update(self, knob_value: int) -> List[Tuple[float, float, float]]:
+        """Advance state for *knob_value* and return per-song gains."""
+        position = (knob_value / 1023.0) * (self.num_songs - 1)
+        pair_idx = int(position)
+        if pair_idx >= self.num_songs - 1:
+            pair_idx = self.num_songs - 2
+            blend = 1.0
+        else:
+            blend = position - pair_idx
+
+        if self._prev_position is not None:
+            prev_pair = int(self._prev_position)
+            if prev_pair >= self.num_songs - 1:
+                prev_pair = self.num_songs - 2
+                prev_blend = 1.0
+            else:
+                prev_blend = self._prev_position - prev_pair
+
+            if pair_idx == prev_pair:
+                self._apply_delta(pair_idx, blend - prev_blend)
+            elif pair_idx > prev_pair:
+                for p in range(prev_pair, pair_idx):
+                    self._pairs[p] = [1.0, 1.0, 1.0]
+                self._fill_forward(pair_idx, blend)
+            else:
+                for p in range(pair_idx + 1, prev_pair + 1):
+                    self._pairs[p] = [0.0, 0.0, 0.0]
+                self._fill_backward(pair_idx, blend)
+        else:
+            self._fill_forward(pair_idx, blend)
+
+        self._prev_position = position
+        self._build_gains(pair_idx)
+        return self._gains
+
+    # -- internal helpers ---------------------------------------------------
+
+    def _apply_delta(self, pair_idx: int, delta_blend: float) -> None:
+        """Cascade a blend delta into the three stem slots (beats→tops→vocals)."""
+        stems = self._pairs[pair_idx]
+        budget = abs(delta_blend) * 3.0
+
+        if delta_blend > 0:
+            for i in range(3):
+                space = 1.0 - stems[i]
+                add = min(budget, space)
+                stems[i] = min(1.0, stems[i] + add)
+                budget -= add
+                if budget <= 1e-9:
+                    break
+        elif delta_blend < 0:
+            for i in range(3):
+                drain = min(budget, stems[i])
+                stems[i] = max(0.0, stems[i] - drain)
+                budget -= drain
+                if budget <= 1e-9:
+                    break
+
+    def _fill_forward(self, pair_idx: int, blend: float) -> None:
+        """Set pair state as if arriving from blend=0 going forward."""
+        budget = blend * 3.0
+        stems = [0.0, 0.0, 0.0]
+        for i in range(3):
+            stems[i] = min(1.0, budget)
+            budget = max(0.0, budget - 1.0)
+        self._pairs[pair_idx] = stems
+
+    def _fill_backward(self, pair_idx: int, blend: float) -> None:
+        """Set pair state as if arriving from blend=1.0 going backward."""
+        drain = (1.0 - blend) * 3.0
+        stems = [1.0, 1.0, 1.0]
+        for i in range(3):
+            d = min(stems[i], drain)
+            stems[i] -= d
+            drain = max(0.0, drain - d)
+        self._pairs[pair_idx] = stems
+
+    def _build_gains(self, active_pair: int) -> None:
+        """Convert raw stem blends into equal-power per-song gains."""
+        gains: List[Tuple[float, float, float]] = [
+            (0.0, 0.0, 0.0)
+        ] * self.num_songs
+
+        b_raw, t_raw, v_raw = self._pairs[active_pair]
+
+        v_a = math.cos(v_raw * math.pi / 2)
+        v_b = math.sin(v_raw * math.pi / 2)
+        b_a = math.cos(b_raw * math.pi / 2)
+        b_b = math.sin(b_raw * math.pi / 2)
+        t_a = math.cos(t_raw * math.pi / 2)
+        t_b = math.sin(t_raw * math.pi / 2)
+
+        gains[active_pair] = (v_a, b_a, t_a)
+        gains[active_pair + 1] = (v_b, b_b, t_b)
+        self._gains = gains
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +505,15 @@ class MockKnobReader:
 # Main
 # ---------------------------------------------------------------------------
 
+def _get_chunk(data: np.ndarray, pos: int, frames: int) -> np.ndarray:
+    """Extract *frames* samples from *data* starting at *pos*, wrapping."""
+    data_len = len(data)
+    end = pos + frames
+    if end <= data_len:
+        return data[pos:end]
+    return np.concatenate([data[pos:], data[: end - data_len]])
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Knob-controlled song crossfade mixer",
@@ -343,10 +530,16 @@ def main() -> None:
         "--songs-dir", type=str, default=None,
         help="Directory containing audio files (default: ./songs)",
     )
+    parser.add_argument(
+        "--no-stems", action="store_true",
+        help="Disable stem separation; use simple volume crossfade instead",
+    )
     args = parser.parse_args()
 
     if args.value is not None:
         args.mock = True
+
+    use_stems = not args.no_stems
 
     # ---- load songs -------------------------------------------------------
     songs_dir = Path(args.songs_dir) if args.songs_dir else get_songs_dir()
@@ -360,21 +553,45 @@ def main() -> None:
         )
         return
 
-    print(f"Loading songs from {songs_dir} ...")
-    songs, names = load_songs(songs_dir)
+    if use_stems:
+        stems_dir = get_stems_dir()
+        print(f"Loading songs from {songs_dir} (stem mode) ...")
+        print("Checking for cached stems ...")
+        _files, names = ensure_stems(songs_dir, stems_dir)
 
-    if len(songs) < 2:
-        print(
-            f"Need at least 2 audio files in {songs_dir}, found {len(songs)}.\n"
-            "Supported formats: MP3, WAV, FLAC, OGG, AIFF."
-        )
-        return
+        if len(names) < 2:
+            print(
+                f"Need at least 2 audio files in {songs_dir}, "
+                f"found {len(names)}.\n"
+                "Supported formats: MP3, WAV, FLAC, OGG, AIFF."
+            )
+            return
 
-    num_songs = len(songs)
+        vocals, beats, tops = load_stems(stems_dir, names)
+        songs: Optional[List[np.ndarray]] = None
+    else:
+        print(f"Loading songs from {songs_dir} (simple crossfade) ...")
+        songs, names = load_songs(songs_dir)
+        vocals = None
+        beats = None
+        tops = None
+
+        if len(names) < 2:
+            print(
+                f"Need at least 2 audio files in {songs_dir}, "
+                f"found {len(names)}.\n"
+                "Supported formats: MP3, WAV, FLAC, OGG, AIFF."
+            )
+            return
+
+    num_songs = len(names)
     colors = song_colors(num_songs)
     for i, (name, c) in enumerate(zip(names, colors)):
         print(f"  #{i + 1} {name}  →  RGB({c[0]}, {c[1]}, {c[2]})")
-    print(f"{num_songs} songs loaded.\n")
+    mode_label = "stem transitions" if use_stems else "simple crossfade"
+    print(f"{num_songs} songs loaded ({mode_label}).\n")
+
+    stem_mgr = StemTransitionManager(num_songs) if use_stems else None
 
     # Per-song frame cursor — all advance continuously so turning the knob
     # back re-enters a song where it would have been, not from the start.
@@ -397,12 +614,41 @@ def main() -> None:
 
     knob.start()
 
-    # Shared between the audio callback and the main-loop beat detector.
-    # A plain float assignment is atomic enough for a visual effect.
     current_rms = [0.0]
 
-    # ---- audio callback ---------------------------------------------------
-    def callback(
+    # ---- audio callbacks --------------------------------------------------
+
+    def callback_stems(
+        outdata: np.ndarray,
+        frames: int,
+        _time_info: object,
+        status: sd.CallbackFlags,
+    ) -> None:
+        if status:
+            print(f"  audio: {status}", flush=True)
+
+        stem_gains = stem_mgr.update(knob.value)
+        mixed = np.zeros((frames, 2), dtype=np.float32)
+
+        for i in range(num_songs):
+            vg, bg, tg = stem_gains[i]
+            pos = frame_pos[i]
+
+            song_len = len(vocals[i])
+            end = pos + frames
+            frame_pos[i] = end % song_len
+
+            if vg > 0.001:
+                mixed += _get_chunk(vocals[i], pos, frames) * vg
+            if bg > 0.001:
+                mixed += _get_chunk(beats[i], pos, frames) * bg
+            if tg > 0.001:
+                mixed += _get_chunk(tops[i], pos, frames) * tg
+
+        outdata[:] = mixed
+        current_rms[0] = float(np.sqrt(np.mean(mixed * mixed)))
+
+    def callback_simple(
         outdata: np.ndarray,
         frames: int,
         _time_info: object,
@@ -416,24 +662,18 @@ def main() -> None:
 
         for i in range(num_songs):
             pos = frame_pos[i]
-            song = songs[i]
-            song_len = len(song)
-
-            # Advance position regardless of gain (keeps songs time-aligned)
+            song_len = len(songs[i])
             end = pos + frames
-            if end <= song_len:
-                chunk = song[pos:end]
-            else:
-                chunk = np.concatenate([song[pos:], song[: end - song_len]])
-
             frame_pos[i] = end % song_len
 
             g = gains[i]
             if g > 0.001:
-                mixed += chunk * g
+                mixed += _get_chunk(songs[i], pos, frames) * g
 
         outdata[:] = mixed
         current_rms[0] = float(np.sqrt(np.mean(mixed * mixed)))
+
+    active_callback = callback_stems if use_stems else callback_simple
 
     # ---- run --------------------------------------------------------------
     with sd.OutputStream(
@@ -441,32 +681,45 @@ def main() -> None:
         channels=2,
         dtype="float32",
         blocksize=BLOCK_SIZE,
-        callback=callback,
+        callback=active_callback,
     ):
         beat = BeatDetector()
         tick = 0
         print("Mixer running — Ctrl+C to stop.\n")
         try:
             while True:
-                gains = knob_to_gains(knob.value, num_songs)
                 brightness = beat.update(current_rms[0])
 
-                cmd = led_command(gains, colors, brightness=brightness)
+                if use_stems:
+                    stem_gains = stem_mgr.gains
+                    led_gains = [max(vg, bg, tg) for vg, bg, tg in stem_gains]
+                else:
+                    led_gains = knob_to_gains(knob.value, num_songs)
+
+                cmd = led_command(led_gains, colors, brightness=brightness)
                 knob.send(cmd)
 
-                # Print status at a readable pace (~5 Hz) while LEDs
-                # update at the full loop rate (~20 Hz).
                 tick += 1
                 if tick % 4 == 0:
-                    parts = [
-                        f"{names[i]}: {g:.0%}"
-                        for i, g in enumerate(gains)
-                        if g > 0.01
-                    ]
+                    if use_stems:
+                        stem_gains = stem_mgr.gains
+                        parts = []
+                        for i, (vg, bg, tg) in enumerate(stem_gains):
+                            if vg > 0.01 or bg > 0.01 or tg > 0.01:
+                                parts.append(
+                                    f"{names[i]}[v:{vg:.0%} b:{bg:.0%} t:{tg:.0%}]"
+                                )
+                    else:
+                        simple_gains = knob_to_gains(knob.value, num_songs)
+                        parts = [
+                            f"{names[i]}: {g:.0%}"
+                            for i, g in enumerate(simple_gains)
+                            if g > 0.01
+                        ]
                     label = " + ".join(parts) if parts else "silence"
                     bar = "█" * int(brightness * 10)
                     print(
-                        f"\r  Knob {knob.value:4d}  │  {label:<40s} │ ♪ {bar:<10s}",
+                        f"\r  Knob {knob.value:4d}  │  {label:<50s} │ ♪ {bar:<10s}",
                         end="", flush=True,
                     )
                 time.sleep(0.05)

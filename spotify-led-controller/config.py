@@ -70,3 +70,11 @@ def get_songs_dir() -> Path:
     if env_dir:
         return Path(env_dir)
     return Path(__file__).parent / "songs"
+
+
+def get_stems_dir() -> Path:
+    """Get the directory for cached stem-separated audio files."""
+    env_dir = os.environ.get("STEMS_DIR")
+    if env_dir:
+        return Path(env_dir)
+    return Path(__file__).parent / "stems"
