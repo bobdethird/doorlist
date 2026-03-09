@@ -1,0 +1,18 @@
+.env
+.env.local
+.cache-*
+.spotify_cache
+*.pyc
+__pycache__/
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Audio files in songs/ can be large; track them with Git LFS or keep local
+songs/*.wav
+songs/*.flac
+songs/*.ogg
+songs/*.aiff
+songs/*.mp3
