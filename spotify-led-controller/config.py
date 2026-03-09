@@ -20,6 +20,10 @@ SAMPLE_RATE = 44100
 BLOCK_SIZE = 1024
 SUPPORTED_AUDIO_EXTENSIONS = {".wav", ".flac", ".ogg", ".aiff", ".mp3"}
 
+# NeoPixel defaults (must match #defines in knob_sender.ino)
+NUM_NEOPIXELS = 8
+LED_BRIGHTNESS = 127  # 0-255 per channel (127 ≈ 50 % brightness / current)
+
 
 def find_arduino_port() -> Optional[str]:
     """

@@ -16,6 +16,7 @@ They are loaded in alphabetical order.
 """
 
 import argparse
+import colorsys
 import math
 import threading
 import time
@@ -29,6 +30,8 @@ import soundfile as sf
 from config import (
     BLOCK_SIZE,
     DEFAULT_BAUD_RATE,
+    LED_BRIGHTNESS,
+    NUM_NEOPIXELS,
     SAMPLE_RATE,
     SUPPORTED_AUDIO_EXTENSIONS,
     get_serial_port,
@@ -146,11 +149,54 @@ def knob_to_gains(knob_value: int, num_songs: int) -> List[float]:
 
 
 # ---------------------------------------------------------------------------
+# NeoPixel colors
+# ---------------------------------------------------------------------------
+
+def song_colors(num_songs: int, brightness: int = LED_BRIGHTNESS) -> List[Tuple[int, int, int]]:
+    """Assign each song an evenly-spaced hue around the colour wheel."""
+    colors = []
+    for i in range(num_songs):
+        h = i / num_songs
+        r, g, b = colorsys.hsv_to_rgb(h, 1.0, 1.0)
+        colors.append((int(r * brightness), int(g * brightness), int(b * brightness)))
+    return colors
+
+
+def led_command(gains: List[float], colors: List[Tuple[int, int, int]],
+                num_pixels: int = NUM_NEOPIXELS) -> str:
+    """Build an ``L`` command string from per-song gains and colours.
+
+    The 8 NeoPixels are split proportionally between the two active songs
+    so you can *see* the crossfade position on the strip.
+    """
+    active = [(i, g) for i, g in enumerate(gains) if g > 0.01]
+
+    if not active:
+        return f"L0,0,0,0,0,0,{num_pixels}"
+
+    if len(active) == 1:
+        r, g, b = colors[active[0][0]]
+        return f"L{r},{g},{b},{r},{g},{b},{num_pixels}"
+
+    idx_a, gain_a = active[0]
+    idx_b, gain_b = active[1]
+    r1, g1, b1 = colors[idx_a]
+    r2, g2, b2 = colors[idx_b]
+    split = round(gain_a / (gain_a + gain_b) * num_pixels)
+    split = max(0, min(num_pixels, split))
+    return f"L{r1},{g1},{b1},{r2},{g2},{b2},{split}"
+
+
+# ---------------------------------------------------------------------------
 # Knob readers (real serial + mock)
 # ---------------------------------------------------------------------------
 
 class KnobReader:
-    """Background thread that reads ``K<value>\\n`` lines from Arduino."""
+    """Bidirectional serial link to the Arduino.
+
+    A background thread reads ``K<value>\\n`` knob lines; the main thread
+    can call :meth:`send` to push LED commands back.
+    """
 
     def __init__(self, port: str, baudrate: int = DEFAULT_BAUD_RATE):
         self.value = 512
@@ -158,26 +204,42 @@ class KnobReader:
         self._baudrate = baudrate
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._serial = None
 
     def start(self) -> None:
+        import serial as _serial
+
+        self._serial = _serial.Serial(self._port, self._baudrate, timeout=0.1)
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
         self._running = False
+        if self._serial and self._serial.is_open:
+            self._serial.close()
+
+    def send(self, msg: str) -> None:
+        """Write a command line to the Arduino (called from main thread)."""
+        ser = self._serial
+        if ser and ser.is_open:
+            try:
+                ser.write(f"{msg}\n".encode())
+            except Exception:
+                pass
 
     def _loop(self) -> None:
-        import serial as _serial
-
-        with _serial.Serial(self._port, self._baudrate, timeout=0.1) as ser:
-            while self._running:
-                line = ser.readline().decode("ascii", errors="ignore").strip()
+        while self._running:
+            try:
+                line = self._serial.readline().decode("ascii", errors="ignore").strip()
                 if line.startswith("K"):
                     try:
                         self.value = max(0, min(1023, int(line[1:])))
                     except ValueError:
                         pass
+            except Exception:
+                if not self._running:
+                    break
 
 
 class MockKnobReader:
@@ -202,6 +264,9 @@ class MockKnobReader:
 
     def stop(self) -> None:
         self._running = False
+
+    def send(self, msg: str) -> None:  # noqa: D102
+        pass
 
     def _sweep(self) -> None:
         direction = 1
@@ -264,6 +329,9 @@ def main() -> None:
         return
 
     num_songs = len(songs)
+    colors = song_colors(num_songs)
+    for i, (name, c) in enumerate(zip(names, colors)):
+        print(f"  #{i + 1} {name}  →  RGB({c[0]}, {c[1]}, {c[2]})")
     print(f"{num_songs} songs loaded.\n")
 
     # Per-song frame cursor — all advance continuously so turning the knob
@@ -332,6 +400,10 @@ def main() -> None:
         try:
             while True:
                 gains = knob_to_gains(knob.value, num_songs)
+
+                cmd = led_command(gains, colors)
+                knob.send(cmd)
+
                 parts = [
                     f"{names[i]}: {g:.0%}"
                     for i, g in enumerate(gains)
