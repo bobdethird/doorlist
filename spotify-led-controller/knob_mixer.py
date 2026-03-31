@@ -22,6 +22,7 @@ They are loaded in alphabetical order.
 import argparse
 import colorsys
 import math
+import random
 import threading
 import time
 from pathlib import Path
@@ -37,6 +38,10 @@ from config import (
     LED_BRIGHTNESS,
     NUM_NEOPIXELS,
     SAMPLE_RATE,
+    SOLENOID_CLUSTER_GAP_MS,
+    SOLENOID_CLUSTER_MAX_MS,
+    SOLENOID_COOLDOWN_MS,
+    SOLENOID_PULSE_MS,
     SUPPORTED_AUDIO_EXTENSIONS,
     get_serial_port,
     get_songs_dir,
@@ -340,6 +345,54 @@ def song_colors(num_songs: int, brightness: int = LED_BRIGHTNESS) -> List[Tuple[
     return colors
 
 
+class DynamicColorManager:
+    """Party / DJ-style color manager — snaps to random vivid hues on beats.
+
+    Every beat transient triggers a jump to a completely new set of random
+    hues (full saturation, maximum vividness).  Adjacent songs always get
+    contrasting hues so the LED strip shows a clear split.  During quiet
+    passages the colors still auto-cycle every few seconds so the strip
+    never looks frozen.
+    """
+
+    def __init__(self, num_songs: int, brightness: int = LED_BRIGHTNESS,
+                 auto_cycle_sec: float = 3.0):
+        self._num_songs = num_songs
+        self._brightness = brightness
+        self._auto_cycle = auto_cycle_sec
+        self._hues = [random.random() for _ in range(num_songs)]
+        self._prev_flash = 0.0
+        self._last_change = time.time()
+
+    def _randomize(self) -> None:
+        """Pick a new set of well-separated random hues."""
+        base = random.random()
+        spread = 0.25 + random.random() * 0.25  # 90°-180° apart
+        for i in range(self._num_songs):
+            jitter = random.uniform(-0.05, 0.05)
+            self._hues[i] = (base + i * spread + jitter) % 1.0
+        self._last_change = time.time()
+
+    def update(self, rms: float, beat_flash: float) -> List[Tuple[int, int, int]]:
+        """Return current per-song RGB tuples.  Call once per display tick."""
+        beat_hit = beat_flash > 0.55 and beat_flash > self._prev_flash
+        auto_jump = (time.time() - self._last_change) > self._auto_cycle
+        self._prev_flash = beat_flash
+
+        if beat_hit or auto_jump:
+            self._randomize()
+
+        colors: List[Tuple[int, int, int]] = []
+        for i in range(self._num_songs):
+            r, g, b = colorsys.hsv_to_rgb(self._hues[i], 1.0, 1.0)
+            colors.append((
+                int(r * self._brightness),
+                int(g * self._brightness),
+                int(b * self._brightness),
+            ))
+        return colors
+
+
 def led_command(gains: List[float], colors: List[Tuple[int, int, int]],
                 num_pixels: int = NUM_NEOPIXELS,
                 brightness: float = 1.0) -> str:
@@ -405,6 +458,68 @@ class BeatDetector:
         self._flash *= self._decay
 
         return min(1.0, self._floor + self._flash * (1.0 - self._floor))
+
+
+class SolenoidController:
+    """Trigger one solenoid pulse for the dominant hit in a short burst."""
+
+    def __init__(self, threshold: float = 1.8,
+                 cooldown_ms: float = SOLENOID_COOLDOWN_MS,
+                 cluster_gap_ms: float = SOLENOID_CLUSTER_GAP_MS,
+                 cluster_max_ms: float = SOLENOID_CLUSTER_MAX_MS):
+        self._avg = 0.0
+        self._threshold = threshold
+        self._cooldown = cooldown_ms / 1000.0
+        self._cluster_gap = cluster_gap_ms / 1000.0
+        self._cluster_max = cluster_max_ms / 1000.0
+        self._last_fire = 0.0
+        self._cluster_start = 0.0
+        self._cluster_last_hit = 0.0
+        self._cluster_peak = 0.0
+        self._has_cluster = False
+
+    def _reset_cluster(self) -> None:
+        self._has_cluster = False
+        self._cluster_start = 0.0
+        self._cluster_last_hit = 0.0
+        self._cluster_peak = 0.0
+
+    def update(self, drums_rms: float) -> bool:
+        """Return True when a clustered burst should emit one pulse."""
+        now = time.monotonic()
+        if self._avg < 1e-6:
+            self._avg = drums_rms
+            return False
+
+        hit = drums_rms > self._avg * self._threshold
+        self._avg = self._avg * 0.92 + drums_rms * 0.08
+
+        if hit:
+            if not self._has_cluster:
+                self._has_cluster = True
+                self._cluster_start = now
+                self._cluster_last_hit = now
+                self._cluster_peak = drums_rms
+            else:
+                self._cluster_last_hit = now
+                self._cluster_peak = max(self._cluster_peak, drums_rms)
+
+        if not self._has_cluster:
+            return False
+
+        cluster_closed = (
+            (not hit and (now - self._cluster_last_hit) >= self._cluster_gap)
+            or (now - self._cluster_start) >= self._cluster_max
+        )
+        if not cluster_closed:
+            return False
+
+        should_fire = (now - self._last_fire) >= self._cooldown
+        self._reset_cluster()
+        if should_fire:
+            self._last_fire = now
+            return True
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -534,12 +649,17 @@ def main() -> None:
         "--no-stems", action="store_true",
         help="Disable stem separation; use simple volume crossfade instead",
     )
+    parser.add_argument(
+        "--no-solenoid", action="store_true",
+        help="Disable solenoid beat pulses",
+    )
     args = parser.parse_args()
 
     if args.value is not None:
         args.mock = True
 
     use_stems = not args.no_stems
+    use_solenoid = not args.no_solenoid
 
     # ---- load songs -------------------------------------------------------
     songs_dir = Path(args.songs_dir) if args.songs_dir else get_songs_dir()
@@ -567,7 +687,7 @@ def main() -> None:
             )
             return
 
-        vocals, beats, tops = load_stems(stems_dir, names)
+        vocals, beats, tops, drum_stems = load_stems(stems_dir, names)
         songs: Optional[List[np.ndarray]] = None
     else:
         print(f"Loading songs from {songs_dir} (simple crossfade) ...")
@@ -575,6 +695,7 @@ def main() -> None:
         vocals = None
         beats = None
         tops = None
+        drum_stems = None
 
         if len(names) < 2:
             print(
@@ -585,13 +706,22 @@ def main() -> None:
             return
 
     num_songs = len(names)
-    colors = song_colors(num_songs)
-    for i, (name, c) in enumerate(zip(names, colors)):
-        print(f"  #{i + 1} {name}  →  RGB({c[0]}, {c[1]}, {c[2]})")
+    dynamic_colors = DynamicColorManager(num_songs)
+    static_colors = song_colors(num_songs)
+    for i, (name, c) in enumerate(zip(names, static_colors)):
+        print(f"  #{i + 1} {name}  →  base RGB({c[0]}, {c[1]}, {c[2]})")
     mode_label = "stem transitions" if use_stems else "simple crossfade"
     print(f"{num_songs} songs loaded ({mode_label}).\n")
+    if use_solenoid:
+        print(
+            "Solenoid enabled "
+            f"({SOLENOID_PULSE_MS} ms pulse / {SOLENOID_COOLDOWN_MS} ms cooldown).\n"
+        )
+    else:
+        print("Solenoid disabled.\n")
 
     stem_mgr = StemTransitionManager(num_songs) if use_stems else None
+    solenoid = SolenoidController() if use_solenoid else None
 
     # Per-song frame cursor — all advance continuously so turning the knob
     # back re-enters a song where it would have been, not from the start.
@@ -615,6 +745,10 @@ def main() -> None:
     knob.start()
 
     current_rms = [0.0]
+    drums_rms_out = [0.0]
+    pending_solenoid_hits = [0]
+    last_solenoid_fire = [0.0]
+    solenoid_lock = threading.Lock()
 
     # ---- audio callbacks --------------------------------------------------
 
@@ -629,6 +763,7 @@ def main() -> None:
 
         stem_gains = stem_mgr.update(knob.value)
         mixed = np.zeros((frames, 2), dtype=np.float32)
+        drums_mix = np.zeros((frames, 2), dtype=np.float32)
 
         for i in range(num_songs):
             vg, bg, tg = stem_gains[i]
@@ -641,12 +776,19 @@ def main() -> None:
             if vg > 0.001:
                 mixed += _get_chunk(vocals[i], pos, frames) * vg
             if bg > 0.001:
-                mixed += _get_chunk(beats[i], pos, frames) * bg
+                beat_chunk = _get_chunk(beats[i], pos, frames) * bg
+                mixed += beat_chunk
+                drums_mix += _get_chunk(drum_stems[i], pos, frames) * bg
             if tg > 0.001:
                 mixed += _get_chunk(tops[i], pos, frames) * tg
 
         outdata[:] = mixed
         current_rms[0] = float(np.sqrt(np.mean(mixed * mixed)))
+        drums_rms_out[0] = float(np.sqrt(np.mean(drums_mix * drums_mix)))
+        if solenoid and solenoid.update(drums_rms_out[0]):
+            with solenoid_lock:
+                pending_solenoid_hits[0] += 1
+                last_solenoid_fire[0] = time.time()
 
     def callback_simple(
         outdata: np.ndarray,
@@ -672,6 +814,11 @@ def main() -> None:
 
         outdata[:] = mixed
         current_rms[0] = float(np.sqrt(np.mean(mixed * mixed)))
+        drums_rms_out[0] = current_rms[0]
+        if solenoid and solenoid.update(drums_rms_out[0]):
+            with solenoid_lock:
+                pending_solenoid_hits[0] += 1
+                last_solenoid_fire[0] = time.time()
 
     active_callback = callback_stems if use_stems else callback_simple
 
@@ -689,6 +836,7 @@ def main() -> None:
         try:
             while True:
                 brightness = beat.update(current_rms[0])
+                colors = dynamic_colors.update(current_rms[0], brightness)
 
                 if use_stems:
                     stem_gains = stem_mgr.gains
@@ -698,6 +846,12 @@ def main() -> None:
 
                 cmd = led_command(led_gains, colors, brightness=brightness)
                 knob.send(cmd)
+                if solenoid:
+                    with solenoid_lock:
+                        pending_hits = pending_solenoid_hits[0]
+                        pending_solenoid_hits[0] = 0
+                    for _ in range(pending_hits):
+                        knob.send("S")
 
                 tick += 1
                 if tick % 4 == 0:
@@ -717,12 +871,19 @@ def main() -> None:
                             if g > 0.01
                         ]
                     label = " + ".join(parts) if parts else "silence"
+                    with solenoid_lock:
+                        recent_solenoid_fire = last_solenoid_fire[0]
+                    solenoid_text = (
+                        "SOL"
+                        if time.time() - recent_solenoid_fire < 0.2
+                        else "   "
+                    )
                     bar = "█" * int(brightness * 10)
                     print(
-                        f"\r  Knob {knob.value:4d}  │  {label:<50s} │ ♪ {bar:<10s}",
+                        f"\r  Knob {knob.value:4d}  │  {label:<50s} │ {solenoid_text} │ ♪ {bar:<10s}",
                         end="", flush=True,
                     )
-                time.sleep(0.05)
+                time.sleep(0.01)
         except KeyboardInterrupt:
             print("\nStopping...")
 

@@ -104,21 +104,23 @@ def _load_stem(path: Path) -> np.ndarray:
 
 def load_stems(
     stems_dir: Path, names: List[str],
-) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
+) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
     """Load and recombine stems for each song.
 
-    Returns (vocals_list, beats_list, tops_list) where:
+    Returns (vocals_list, beats_list, tops_list, drums_list) where:
       - vocals = vocals stem
       - beats  = drums + bass stems summed
       - tops   = other stem
+      - drums  = drums stem only
 
-    Each entry is a stereo float32 array at SAMPLE_RATE.  All three stems
+    Each entry is a stereo float32 array at SAMPLE_RATE.  All four stems
     are trimmed to the same length and peak-normalised as a group so the
     recombined signal matches the original loudness.
     """
     all_vocals: List[np.ndarray] = []
     all_beats: List[np.ndarray] = []
     all_tops: List[np.ndarray] = []
+    all_drums: List[np.ndarray] = []
 
     for name in names:
         d = _stem_dir(stems_dir, name)
@@ -140,10 +142,12 @@ def load_stems(
             v *= scale
             beats *= scale
             tops *= scale
+            drums *= scale
 
         all_vocals.append(v)
         all_beats.append(beats)
         all_tops.append(tops)
+        all_drums.append(drums[:min_len])
         print(f"  Loaded stems: {name}  ({min_len / SAMPLE_RATE:.1f}s)")
 
-    return all_vocals, all_beats, all_tops
+    return all_vocals, all_beats, all_tops, all_drums

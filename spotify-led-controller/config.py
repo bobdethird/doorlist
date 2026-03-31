@@ -23,6 +23,10 @@ SUPPORTED_AUDIO_EXTENSIONS = {".wav", ".flac", ".ogg", ".aiff", ".mp3"}
 # NeoPixel defaults (must match #defines in knob_sender.ino)
 NUM_NEOPIXELS = 8
 LED_BRIGHTNESS = 127  # 0-255 per channel (127 ≈ 50 % brightness / current)
+SOLENOID_PULSE_MS = 60
+SOLENOID_COOLDOWN_MS = 120
+SOLENOID_CLUSTER_GAP_MS = 45
+SOLENOID_CLUSTER_MAX_MS = 100
 
 
 def find_arduino_port() -> Optional[str]:

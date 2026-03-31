@@ -17,14 +17,18 @@
 
 #define KNOB_PIN       A0
 #define LED_PIN        12
+#define MOS_PIN        9
 #define NUM_PIXELS     8
 #define SEND_INTERVAL  20     // ms (~50 Hz)
 #define SMOOTHING      0.15f
+#define SOLENOID_PULSE_MS 60
 
 Adafruit_NeoPixel strip(NUM_PIXELS, LED_PIN, NEO_GRB + NEO_KHZ800);
 
 float    smoothed = 0;
 unsigned long lastSend = 0;
+bool     solOn = false;
+unsigned long solStart = 0;
 char     cmdBuf[64];
 uint8_t  cmdLen = 0;
 
@@ -42,6 +46,13 @@ int parseInts(const char *str, int *out, int maxCount) {
 }
 
 void handleCommand() {
+  if (cmdBuf[0] == 'S') {
+    digitalWrite(MOS_PIN, HIGH);
+    solOn = true;
+    solStart = millis();
+    return;
+  }
+
   if (cmdBuf[0] != 'L') return;
 
   // L<r1>,<g1>,<b1>,<r2>,<g2>,<b2>,<split>
@@ -63,12 +74,19 @@ void handleCommand() {
 void setup() {
   Serial.begin(9600);
   smoothed = analogRead(KNOB_PIN);
+  pinMode(MOS_PIN, OUTPUT);
+  digitalWrite(MOS_PIN, LOW);
   strip.begin();
   strip.clear();
   strip.show();
 }
 
 void loop() {
+  if (solOn && (millis() - solStart >= SOLENOID_PULSE_MS)) {
+    digitalWrite(MOS_PIN, LOW);
+    solOn = false;
+  }
+
   // --- send knob value ---
   int raw = analogRead(KNOB_PIN);
   smoothed += SMOOTHING * (raw - smoothed);
