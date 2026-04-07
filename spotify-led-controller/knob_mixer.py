@@ -345,6 +345,32 @@ def song_colors(num_songs: int, brightness: int = LED_BRIGHTNESS) -> List[Tuple[
     return colors
 
 
+PARTY_HUES = [
+    0.83,   # purple
+    0.75,   # violet
+    0.92,   # magenta / hot pink
+    0.0,    # red
+    0.97,   # rose
+    0.66,   # blue
+    0.58,   # electric blue
+    0.05,   # red-orange
+]
+
+
+def party_color() -> Tuple[int, int, int]:
+    """Return one saturated party-style RGB colour."""
+    hue = random.choice(PARTY_HUES) + random.uniform(-0.03, 0.03)
+    sat = random.uniform(0.8, 1.0)
+    val = random.uniform(0.4, 0.55)
+    r, g, b = colorsys.hsv_to_rgb(hue % 1.0, sat, val)
+    return (int(r * 255), int(g * 255), int(b * 255))
+
+
+def party_palette(num_pairs: int = 4) -> List[Tuple[int, int, int]]:
+    """Return one random colour for each LED pair on the strip."""
+    return [party_color() for _ in range(num_pairs)]
+
+
 class DynamicColorManager:
     """Party / DJ-style color manager — snaps to random vivid hues on beats.
 
@@ -736,7 +762,6 @@ def main() -> None:
             return
 
     num_songs = len(names)
-    dynamic_colors = DynamicColorManager(num_songs)
     static_colors = song_colors(num_songs)
     for i, (name, c) in enumerate(zip(names, static_colors)):
         print(f"  #{i + 1} {name}  →  base RGB({c[0]}, {c[1]}, {c[2]})")
@@ -779,6 +804,8 @@ def main() -> None:
     pending_solenoid_hits = [0]
     last_solenoid_fire = [0.0]
     solenoid_lock = threading.Lock()
+    led_colors = party_palette()
+    prev_brightness = 0.0
 
     # ---- audio callbacks --------------------------------------------------
 
@@ -866,15 +893,11 @@ def main() -> None:
         try:
             while True:
                 brightness = beat.update(current_rms[0])
-                colors = dynamic_colors.update(current_rms[0], brightness)
+                if brightness > 0.55 and brightness > prev_brightness:
+                    led_colors = party_palette()
+                prev_brightness = brightness
 
-                if use_stems:
-                    stem_gains = stem_mgr.gains
-                    led_gains = [max(vg, bg, tg) for vg, bg, tg in stem_gains]
-                else:
-                    led_gains = knob_to_gains(knob.value, num_songs)
-
-                cmd = led_command(led_gains, colors, brightness=brightness)
+                cmd = led_pairs_command(led_colors, brightness=brightness)
                 knob.send(cmd)
                 if solenoid:
                     with solenoid_lock:

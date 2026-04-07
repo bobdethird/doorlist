@@ -41,19 +41,40 @@ from knob_mixer import BeatDetector, KnobReader, _resample, led_pairs_command
 PLOT_FPS = 30
 
 
-def load_drums(song_name: str, stems_dir: Path) -> np.ndarray:
-    stem_path = stems_dir / "htdemucs" / song_name / "drums.wav"
+def _load_stem(song_name: str, stems_dir: Path, stem: str) -> np.ndarray:
+    stem_path = stems_dir / "htdemucs" / song_name / f"{stem}.wav"
     if not stem_path.is_file():
-        raise FileNotFoundError(f"Missing drums stem: {stem_path}")
+        raise FileNotFoundError(f"Missing {stem} stem: {stem_path}")
     data, sr = sf.read(stem_path, dtype="float32")
     if data.ndim == 1:
         data = np.column_stack([data, data])
     if sr != SAMPLE_RATE:
         data = _resample(data, sr, SAMPLE_RATE)
-    peak = np.max(np.abs(data))
-    if peak > 0:
-        data *= 0.9 / peak
     return data
+
+
+def load_full_mix(song_name: str, stems_dir: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Load all stems, return (full_mix, drums_only) as stereo float32."""
+    stem_names = ("drums", "bass", "vocals", "other")
+    stems = {name: _load_stem(song_name, stems_dir, name) for name in stem_names}
+
+    max_len = max(len(s) for s in stems.values())
+    full_mix = np.zeros((max_len, 2), dtype=np.float32)
+    for s in stems.values():
+        full_mix[: len(s)] += s
+
+    peak = np.max(np.abs(full_mix))
+    if peak > 0:
+        full_mix *= 0.9 / peak
+
+    drums = np.zeros((max_len, 2), dtype=np.float32)
+    d = stems["drums"]
+    drums[: len(d)] = d
+    drums_peak = np.max(np.abs(drums))
+    if drums_peak > 0:
+        drums *= 0.9 / drums_peak
+
+    return full_mix, drums
 
 
 def load_hit_times(song_name: str, stems_dir: Path, offset_s: float = 0.0) -> list[float]:
@@ -83,10 +104,10 @@ def main() -> None:
     args = parser.parse_args()
 
     stems_dir = get_stems_dir()
-    drums = load_drums(args.song, stems_dir)
+    full_mix, drums = load_full_mix(args.song, stems_dir)
     hit_times = load_hit_times(args.song, stems_dir, offset_s=args.offset)
-    duration = len(drums) / SAMPLE_RATE
-    print(f"Loaded drums stem: {args.song}  ({duration:.1f}s)")
+    duration = len(full_mix) / SAMPLE_RATE
+    print(f"Loaded full mix: {args.song}  ({duration:.1f}s)")
     print(f"Loaded {len(hit_times)} pre-computed solenoid hits")
 
     window_sec = args.window
@@ -125,16 +146,18 @@ def main() -> None:
             print(f"  audio: {status}", flush=True)
 
         pos = frame_pos[0]
-        data_len = len(drums)
+        data_len = len(full_mix)
         end = pos + frames
         if end <= data_len:
-            chunk = drums[pos:end]
+            play_chunk = full_mix[pos:end]
+            drum_chunk = drums[pos:end]
         else:
-            chunk = np.concatenate([drums[pos:], drums[:end - data_len]])
+            play_chunk = np.concatenate([full_mix[pos:], full_mix[:end - data_len]])
+            drum_chunk = np.concatenate([drums[pos:], drums[:end - data_len]])
         frame_pos[0] = end % data_len
-        outdata[:] = chunk
+        outdata[:] = play_chunk
 
-        rms = float(np.sqrt(np.mean(chunk * chunk)))
+        rms = float(np.sqrt(np.mean(drum_chunk * drum_chunk)))
         t_start = pos / SAMPLE_RATE
         t_end = end / SAMPLE_RATE
         brightness = beat.update(rms)
@@ -182,7 +205,7 @@ def main() -> None:
         gridspec_kw={"height_ratios": [2.5, 1], "hspace": 0.05},
     )
     fig.patch.set_facecolor("#0e0e0e")
-    fig.canvas.manager.set_window_title(f"Drums — {args.song}")
+    fig.canvas.manager.set_window_title(f"Full Mix — {args.song}")
 
     for ax in (ax_rms, ax_bright):
         ax.set_facecolor("#141414")
@@ -198,7 +221,7 @@ def main() -> None:
     solenoid_artists: list = []
 
     ax_rms.set_ylabel("RMS Energy", color="#aaa", fontsize=9)
-    ax_rms.set_title(f"Live Drums — {args.song}  (pre-computed hits)", color="#eee",
+    ax_rms.set_title(f"Full Mix — {args.song}  (pre-computed hits)", color="#eee",
                      fontsize=12, pad=8)
     ax_bright.set_ylabel("Brightness", color="#aaa", fontsize=9)
     ax_bright.set_xlabel("Time (s)", color="#aaa", fontsize=9)
