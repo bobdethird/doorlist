@@ -13,7 +13,9 @@ Usage:
 
 import argparse
 import collections
+import colorsys
 import json
+import random
 import threading
 import time
 from pathlib import Path
@@ -34,7 +36,7 @@ from config import (
     get_serial_port,
     get_stems_dir,
 )
-from knob_mixer import BeatDetector, KnobReader, _resample, led_command
+from knob_mixer import BeatDetector, KnobReader, _resample, led_pairs_command
 
 PLOT_FPS = 30
 
@@ -102,6 +104,8 @@ def main() -> None:
     hit_index = [0]
     pending_hits = [0]
     fired_times: list[float] = []
+    flash_count = [0]
+    prev_brightness = [0.0]
 
     use_solenoid = not args.no_solenoid
     knob: Optional[KnobReader] = None
@@ -135,6 +139,10 @@ def main() -> None:
         t_end = end / SAMPLE_RATE
         brightness = beat.update(rms)
 
+        if brightness > 0.55 and brightness > prev_brightness[0]:
+            flash_count[0] += 1
+        prev_brightness[0] = brightness
+
         idx = hit_index[0]
         fires = 0
         while idx < len(hit_times) and hit_times[idx] < t_end:
@@ -151,6 +159,23 @@ def main() -> None:
             if fires:
                 pending_hits[0] += fires
 
+    PARTY_HUES = [
+        0.83, 0.75, 0.92, 0.0, 0.97, 0.66, 0.58, 0.05,
+    ]
+
+    def party_color() -> tuple[int, int, int]:
+        hue = random.choice(PARTY_HUES) + random.uniform(-0.03, 0.03)
+        sat = random.uniform(0.8, 1.0)
+        val = random.uniform(0.4, 0.55)
+        r, g, b = colorsys.hsv_to_rgb(hue % 1.0, sat, val)
+        return (int(r * 255), int(g * 255), int(b * 255))
+
+    def party_palette() -> list[tuple[int, int, int]]:
+        return [party_color() for _ in range(4)]
+
+    led_colors = party_palette()
+    last_flash_count = [0]
+
     # -- build the figure --
     fig, (ax_rms, ax_bright) = plt.subplots(
         2, 1, figsize=(14, 6), sharex=True,
@@ -165,10 +190,11 @@ def main() -> None:
         for spine in ax.spines.values():
             spine.set_color("#333")
 
-    line_rms, = ax_rms.plot([], [], color="#4fc3f7", linewidth=0.8, alpha=0.9)
-    fill_rms = ax_rms.fill_between([0], [0], color="#4fc3f7", alpha=0.25)
-    line_bright, = ax_bright.plot([], [], color="#ab47bc", linewidth=0.8, alpha=0.9)
-    fill_bright = ax_bright.fill_between([0], [0], color="#ab47bc", alpha=0.25)
+    default_hex = f"#{led_colors[0][0]:02x}{led_colors[0][1]:02x}{led_colors[0][2]:02x}"
+    line_rms, = ax_rms.plot([], [], color=default_hex, linewidth=0.8, alpha=0.9)
+    fill_rms = ax_rms.fill_between([0], [0], color=default_hex, alpha=0.25)
+    line_bright, = ax_bright.plot([], [], color=default_hex, linewidth=0.8, alpha=0.9)
+    fill_bright = ax_bright.fill_between([0], [0], color=default_hex, alpha=0.25)
     solenoid_artists: list = []
 
     ax_rms.set_ylabel("RMS Energy", color="#aaa", fontsize=9)
@@ -200,13 +226,23 @@ def main() -> None:
         t_end = t_now
         t_axis = np.linspace(t_start, t_end, len(rms_arr))
 
+        fc = flash_count[0]
+        if fc != last_flash_count[0]:
+            led_colors[:] = party_palette()
+            last_flash_count[0] = fc
+
+        c = led_colors[0]
+        hex_c = f"#{c[0]:02x}{c[1]:02x}{c[2]:02x}"
+
         line_rms.set_data(t_axis, rms_arr)
+        line_rms.set_color(hex_c)
         line_bright.set_data(t_axis, bright_arr)
+        line_bright.set_color(hex_c)
 
         fill_rms.remove()
-        fill_rms = ax_rms.fill_between(t_axis, rms_arr, color="#4fc3f7", alpha=0.25)
+        fill_rms = ax_rms.fill_between(t_axis, rms_arr, color=hex_c, alpha=0.25)
         fill_bright.remove()
-        fill_bright = ax_bright.fill_between(t_axis, bright_arr, color="#ab47bc", alpha=0.25)
+        fill_bright = ax_bright.fill_between(t_axis, bright_arr, color=hex_c, alpha=0.25)
 
         ax_rms.set_xlim(t_start, t_end)
         rms_peak = max(rms_arr.max() * 1.3, 0.01)
@@ -220,16 +256,16 @@ def main() -> None:
         for ft in recent_fires:
             age = t_now - ft
             alpha = max(0.2, 1.0 - age / 0.4)
-            ln = ax_rms.axvline(ft, color="#ef5350", alpha=alpha, linewidth=1.5)
+            ln = ax_rms.axvline(ft, color=hex_c, alpha=alpha, linewidth=1.5)
             solenoid_artists.append(ln)
-            ln2 = ax_bright.axvline(ft, color="#ef5350", alpha=alpha * 0.6, linewidth=1.0)
+            ln2 = ax_bright.axvline(ft, color=hex_c, alpha=alpha * 0.6, linewidth=1.0)
             solenoid_artists.append(ln2)
 
         hit_text.set_text(f"SOLENOID  {n_fires}/{len(hit_times)}" if n_fires else "")
 
         if knob:
             b = bright_arr[-1] if len(bright_arr) else 0.0
-            knob.send(led_command([1.0], [(127, 127, 127)], brightness=b))
+            knob.send(led_pairs_command(led_colors, brightness=b))
             with lock:
                 hits = pending_hits[0]
                 pending_hits[0] = 0

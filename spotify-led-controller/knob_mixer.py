@@ -426,6 +426,36 @@ def led_command(gains: List[float], colors: List[Tuple[int, int, int]],
     return f"L{r1},{g1},{b1},{r2},{g2},{b2},{split}"
 
 
+def led_pairs_command(colors: List[Tuple[int, int, int]],
+                      num_pixels: int = NUM_NEOPIXELS,
+                      pair_size: int = 2,
+                      brightness: float = 1.0) -> str:
+    """Build a ``P`` command for repeated color pairs across the strip.
+
+    For the 8-pixel drums strip this maps 4 colours onto 4 adjacent pairs:
+    LEDs 0-1, 2-3, 4-5, and 6-7.
+    """
+    if pair_size <= 0 or num_pixels % pair_size:
+        raise ValueError("num_pixels must be divisible by pair_size")
+
+    def _scale(rgb: Tuple[int, int, int]) -> Tuple[int, int, int]:
+        return (int(rgb[0] * brightness),
+                int(rgb[1] * brightness),
+                int(rgb[2] * brightness))
+
+    num_pairs = num_pixels // pair_size
+    if not colors:
+        scaled_colors = [(0, 0, 0)] * num_pairs
+    else:
+        scaled_colors = [_scale(colors[min(i, len(colors) - 1)])
+                         for i in range(num_pairs)]
+
+    payload = ",".join(str(component)
+                       for rgb in scaled_colors
+                       for component in rgb)
+    return f"P{payload}"
+
+
 # ---------------------------------------------------------------------------
 # Beat detection
 # ---------------------------------------------------------------------------

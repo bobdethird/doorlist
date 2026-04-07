@@ -11,6 +11,8 @@ Usage:
 """
 
 import argparse
+import colorsys
+import random
 import threading
 import time
 from pathlib import Path
@@ -27,7 +29,7 @@ from config import (
     get_serial_port,
     get_stems_dir,
 )
-from knob_mixer import BeatDetector, KnobReader, SolenoidController, _resample, led_command
+from knob_mixer import BeatDetector, KnobReader, SolenoidController, _resample, led_pairs_command
 
 
 def load_drums(song_name: str, stems_dir: Path) -> np.ndarray:
@@ -93,9 +95,33 @@ def main() -> None:
     current_rms = [0.0]
     pending_hits = [0]
     last_solenoid_fire = [0.0]
+    flash_count = [0]
+    prev_brightness = [0.0]
     lock = threading.Lock()
     frame_pos = [0]
-    led_colors = [(127, 127, 127)]
+
+    PARTY_HUES = [
+        0.83,   # purple
+        0.75,   # violet
+        0.92,   # magenta / hot pink
+        0.0,    # red
+        0.97,   # rose
+        0.66,   # blue
+        0.58,   # electric blue
+        0.05,   # red-orange
+    ]
+
+    def party_color() -> tuple[int, int, int]:
+        hue = random.choice(PARTY_HUES) + random.uniform(-0.03, 0.03)
+        sat = random.uniform(0.8, 1.0)
+        val = random.uniform(0.4, 0.55)
+        r, g, b = colorsys.hsv_to_rgb(hue % 1.0, sat, val)
+        return (int(r * 255), int(g * 255), int(b * 255))
+
+    def party_palette() -> list[tuple[int, int, int]]:
+        return [party_color() for _ in range(4)]
+
+    led_colors = party_palette()
 
     def callback(
         outdata: np.ndarray,
@@ -114,6 +140,11 @@ def main() -> None:
         rms = float(np.sqrt(np.mean(chunk * chunk)))
         current_rms[0] = rms
 
+        brightness = beat.update(rms)
+        if brightness > 0.55 and brightness > prev_brightness[0]:
+            flash_count[0] += 1
+        prev_brightness[0] = brightness
+
         if solenoid and solenoid.update(rms):
             with lock:
                 pending_hits[0] += 1
@@ -128,10 +159,20 @@ def main() -> None:
             blocksize=BLOCK_SIZE,
             callback=callback,
         ):
+            last_fc = 0
             while True:
-                brightness = beat.update(current_rms[0])
+                fc = flash_count[0]
+                if fc != last_fc:
+                    led_colors = party_palette()
+                    last_fc = fc
+
+                brightness = beat._floor + beat._flash * (1.0 - beat._floor)
+
+                palette_text = " ".join(
+                    f"{r:02X}{g:02X}{b:02X}" for r, g, b in led_colors
+                )
                 if knob:
-                    knob.send(led_command([1.0], led_colors, brightness=brightness))
+                    knob.send(led_pairs_command(led_colors, brightness=brightness))
                     with lock:
                         queued_hits = pending_hits[0]
                         pending_hits[0] = 0
@@ -146,7 +187,8 @@ def main() -> None:
                 )
                 bar = "█" * int(brightness * 10)
                 print(
-                    f"\r  Song {args.song:<16s} │ {solenoid_text} │ ♪ {bar:<10s}",
+                    f"\r  Song {args.song:<16s} │ {solenoid_text} │ "
+                    f"{palette_text:<27s} │ ♪ {bar:<10s}",
                     end="", flush=True,
                 )
                 time.sleep(0.01)

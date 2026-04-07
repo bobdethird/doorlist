@@ -5,6 +5,8 @@
  *   OUT → K<0-1023>\n          knob reading at ~50 Hz
  *   IN  ← L<r1>,<g1>,<b1>,<r2>,<g2>,<b2>,<split>\n
  *          Sets the first <split> pixels to color1, the rest to color2.
+ *   IN  ← P<r1>,<g1>,<b1>,<r2>,<g2>,<b2>,<r3>,<g3>,<b3>,<r4>,<g4>,<b4>\n
+ *          Sets the 8 LEDs as 4 adjacent pairs of 2 pixels each.
  *
  * Wiring:
  *   Potentiometer outer pins → 5V and GND
@@ -50,6 +52,24 @@ void handleCommand() {
     digitalWrite(MOS_PIN, HIGH);
     solOn = true;
     solStart = millis();
+    return;
+  }
+
+  if (cmdBuf[0] == 'P') {
+    // P<r1>,<g1>,<b1>,<r2>,<g2>,<b2>,<r3>,<g3>,<b3>,<r4>,<g4>,<b4>
+    int v[12];
+    if (parseInts(cmdBuf + 1, v, 12) != 12) return;
+
+    const int pairSize = 2;
+    const int numPairs = NUM_PIXELS / pairSize;
+    for (int pair = 0; pair < numPairs; pair++) {
+      uint32_t color = strip.Color(v[pair * 3], v[pair * 3 + 1], v[pair * 3 + 2]);
+      int start = pair * pairSize;
+      for (int i = 0; i < pairSize; i++) {
+        strip.setPixelColor(start + i, color);
+      }
+    }
+    strip.show();
     return;
   }
 
